@@ -5,12 +5,13 @@ from typing import List
 
 
 def distance(a, b):
-    def sqr(a):
-        return a * a
-
-    if len(a) != len(b):
+    length = len(a)
+    if length != len(b):
         raise ValueError('Vectors have different dimensions')
-    return sqrt(sum(map(sqr, (x - y for x, y in zip(a, b)))))
+    sum = 0
+    for i in range(length):
+        sum += (a[i] - b[i]) * (a[i] - b[i])
+    return sqrt(sum)
 
 
 def allocate_clusters(vectors, centroids):
