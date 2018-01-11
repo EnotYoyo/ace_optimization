@@ -1,8 +1,8 @@
 test_config = {
-    'objects': 100,
+    'objects': 30,
     'files': 200,
-    'folders': 10,
-    'clusters count': [5, 10, 15, 20, 25, 30],
-    'probability of inverting': 5,
-    'real': False
+    'folders': 40,
+    'clusters count': [40, 50, 60],
+    'probability of inverting': 10,
+    'real': True
 }

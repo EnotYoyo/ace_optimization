@@ -2,32 +2,25 @@ from math import sqrt
 from random import sample
 from collections import defaultdict
 from typing import List
+import numpy as np
 
 
 def distance(a, b):
-    length = len(a)
-    if length != len(b):
+    if len(a) != len(b):
         raise ValueError('Vectors have different dimensions')
-    sum = 0
-    for i in range(length):
-        sum += (a[i] - b[i]) * (a[i] - b[i])
-    return sqrt(sum)
+    return sqrt(np.sum((a - b) ** 2))
 
 
 def allocate_clusters(vectors, centroids):
     clusters = defaultdict(list)
     for vector_index, vector in enumerate(vectors):
         centroid = min(centroids, key=lambda x: distance(vector, x))
-        clusters[centroids.index(centroid)].append(vector_index)
+        clusters[centroids.tolist().index(centroid.tolist())].append(vector_index)
     return clusters
 
 
 def get_centroid(vectors, members_indexes):
-    component_count = len(vectors[0])
-    result = [None] * component_count
-    for component in range(component_count):
-        result[component] = sum((vectors[i][component] for i in members_indexes)) / len(members_indexes)
-    return tuple(result)
+    return np.sum(vectors[i] for i in members_indexes) / len(members_indexes)
 
 
 def get_first_centroids(vectors: List, clusters_count: int):
@@ -46,13 +39,17 @@ def get_first_centroids(vectors: List, clusters_count: int):
     return centroids
 
 
+def has_converged(new_centroids, old_centroids):
+    return set(tuple(x.tolist()) for x in new_centroids) == set(old_centroids.keys())
+
+
 def k_means(vectors: List, clusters_count: int, max_iterations: int = 30):
     clusters = None
-    centroids = get_first_centroids(vectors, clusters_count)
+    _centroids = get_first_centroids(vectors, clusters_count)
+    _vectors = np.array(vectors)
     for i in range(max_iterations):
-        clusters = allocate_clusters(vectors, centroids)
-        centroids = list(map(lambda x: get_centroid(vectors, x), clusters.values()))
-        old_centroids = set(clusters.keys())
-        if old_centroids == set(centroids):
+        clusters = allocate_clusters(_vectors, np.array(_centroids))
+        _centroids = list(map(lambda x: get_centroid(_vectors, x), clusters.values()))
+        if has_converged(_centroids, clusters):
             break
     return clusters
