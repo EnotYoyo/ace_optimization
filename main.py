@@ -1,20 +1,22 @@
-import string
-import shutil
+import os
 import random
+import shutil
+import string
+import win32net
+import win32security
 from collections import defaultdict
+from copy import deepcopy
 from enum import Enum
 from typing import List
 
+import ntsecuritycon
 import win32con
+import win32netcon
 
 from kmeans import k_means
-from copy import deepcopy
-import win32net, win32security
-import win32netcon, ntsecuritycon
-import os
 
 ROOT_FOLDER = 'c:/test_dir/'
-ADMIN_NAME = 'enot'
+ADMIN_NAME = 'Enot'
 USER_SUBNAME = "LabUser"
 
 
@@ -35,40 +37,173 @@ class Ace(object):
         raise ValueError
 
 
-def convert_real_ace_right(right: int) -> int:
-    ace_right = 0
-    if ntsecuritycon.FILE_GENERIC_READ & right == ntsecuritycon.FILE_GENERIC_READ:
-        ace_right += win32con.GENERIC_READ
-    if ntsecuritycon.FILE_GENERIC_WRITE & right == ntsecuritycon.FILE_GENERIC_WRITE:
-        ace_right += win32con.GENERIC_WRITE
-    if ntsecuritycon.FILE_GENERIC_EXECUTE & right == ntsecuritycon.FILE_GENERIC_EXECUTE:
-        ace_right += win32con.GENERIC_EXECUTE
+class NormalizedRight(object):
+    @staticmethod
+    def normalized_ace(ace: Ace):
+        right = 0b0
+        if ace.type == AceType.ALLOWED:
+            if win32con.GENERIC_READ & ace.right:
+                right |= 0b001
+            if (win32con.GENERIC_WRITE | ntsecuritycon.FILE_READ_ATTRIBUTES) & ace.right:
+                right |= 0b010
+            if win32con.GENERIC_EXECUTE & ace.right:
+                right |= 0b100
+        else:
+            if ntsecuritycon.FILE_READ_DATA & ace.right:
+                right |= 0b001 << 3
+            if ntsecuritycon.FILE_WRITE_DATA & ace.right:
+                right |= 0b010 << 3
+            if ntsecuritycon.FILE_EXECUTE & ace.right:
+                right |= 0b100 << 3
+        return right
 
-    return ace_right
+    @staticmethod
+    def real_right(user_name: str, normalized_right: int) -> List[Ace]:
+        result = []
+        res_right = NormalizedRight.real_allow_right(normalized_right)
+        if res_right != 0:
+            result.append(Ace(user_name, res_right))
+
+        res_right = NormalizedRight.real_deny_right(normalized_right)
+        if res_right != 0:
+            result.append(Ace(user_name, res_right, AceType.DENIED))
+
+        return result
+
+    @staticmethod
+    def real_allow_right(right):
+        res_right = 0b0
+        if 0b001 & right:
+            res_right |= win32con.GENERIC_READ
+        if 0b010 & right:
+            res_right |= win32con.GENERIC_WRITE | ntsecuritycon.FILE_READ_ATTRIBUTES
+        if 0b100 & right:
+            res_right |= win32con.GENERIC_EXECUTE
+        return res_right
+
+    @staticmethod
+    def real_deny_right(right):
+        res_right = 0b0
+        if (0b001 << 3) & right:
+            res_right |= ntsecuritycon.FILE_READ_DATA
+        if (0b010 << 3) & right:
+            res_right |= ntsecuritycon.FILE_WRITE_DATA
+        if (0b100 << 3) & right:
+            res_right |= ntsecuritycon.FILE_EXECUTE
+        return res_right
+
+    @staticmethod
+    def is_allow(right: int):
+        return right < 8
+
+    @staticmethod
+    def print(right):
+        print("{:0>6b}".format(right))
+
+    @staticmethod
+    def effective_right(right):
+        if right & 0b111000 == 0:
+            return right
+        return right & (0b111000 | (~right) >> 3)
+
+    @staticmethod
+    def is_equal(r1, r2):
+        return (r1 | 0b111000) == (r2 | 0b111000)
 
 
-def set_right(object_name: str, rights_list: List[Ace]):
-    all_info = win32security.OWNER_SECURITY_INFORMATION | win32security.DACL_SECURITY_INFORMATION
-    sd = win32security.GetNamedSecurityInfo(object_name, win32security.SE_FILE_OBJECT, all_info)
-    dacl = sd.GetSecurityDescriptorDacl()
-    if dacl is None:
-        dacl = win32security.ACL()
+class WinApi(object):
+    def __init__(self):
+        self.all_info = win32security.OWNER_SECURITY_INFORMATION | win32security.DACL_SECURITY_INFORMATION
+        self.pwr_sid = win32security.LookupAccountName(None, ADMIN_NAME)[0]
 
-    for ace in rights_list:
-        sid = win32security.LookupAccountName(None, ace.name)[0]
-        if os.path.isdir(object_name):
+    def set_right(self, object_name: str, rights_list: List[Ace]):
+        sd = win32security.GetNamedSecurityInfo(object_name, win32security.SE_FILE_OBJECT, self.all_info)
+        dacl = sd.GetSecurityDescriptorDacl()
+        if dacl is None:
+            dacl = win32security.ACL()
+
+        for ace in rights_list:
+            sid = win32security.LookupAccountName(None, ace.name)[0]
             if ace.type == AceType.ALLOWED:
                 dacl.AddAccessAllowedAceEx(dacl.GetAclRevision(), win32con.OBJECT_INHERIT_ACE, ace.right, sid)
             if ace.type == AceType.DENIED:
                 dacl.AddAccessDeniedAceEx(dacl.GetAclRevision(), win32con.OBJECT_INHERIT_ACE, ace.right, sid)
+        win32security.SetNamedSecurityInfo(object_name, win32security.SE_FILE_OBJECT, self.all_info, self.pwr_sid,
+                                           self.pwr_sid, dacl, None)
+
+    def add_right(self, object_name: str, ace: Ace):
+        sd = win32security.GetNamedSecurityInfo(object_name, win32security.SE_FILE_OBJECT, self.all_info)
+        dacl = sd.GetSecurityDescriptorDacl()
+        if dacl is None:
+            dacl = win32security.ACL()
+
+        sid = win32security.LookupAccountName(None, ace.name)[0]
+        if ace.type == AceType.ALLOWED:
+            dacl.AddAccessAllowedAceEx(dacl.GetAclRevision(), win32con.OBJECT_INHERIT_ACE, ace.right, sid)
+        if ace.type == AceType.DENIED:
+            dacl.AddAccessDeniedAceEx(dacl.GetAclRevision(), win32con.OBJECT_INHERIT_ACE, ace.right, sid)
+        win32security.SetNamedSecurityInfo(object_name, win32security.SE_FILE_OBJECT, self.all_info, self.pwr_sid,
+                                           self.pwr_sid, dacl, None)
+
+    def delete_ace(self, object_path: str, aceInfo: Ace):
+        sd = win32security.GetFileSecurity(object_path, self.all_info)
+        dacl = sd.GetSecurityDescriptorDacl()
+        if dacl is None:
+            return 0
         else:
-            if ace.type == AceType.ALLOWED:
-                dacl.AddAccessAllowedAce(dacl.GetAclRevision(), ace.right, sid)
-            if ace.type == AceType.DENIED:
-                dacl.AddAccessDeniedAce(dacl.GetAclRevision(), ace.right, sid)
-    pwr_sid = win32security.LookupAccountName(None, ADMIN_NAME)[0]
-    win32security.SetNamedSecurityInfo(object_name, win32security.SE_FILE_OBJECT, all_info, pwr_sid, pwr_sid, dacl,
-                                       None)
+            for ace_no in range(0, dacl.GetAceCount()):
+                _ace = dacl.GetAce(ace_no)
+                ace = Ace(win32security.LookupAccountSid(None, _ace[2])[0],
+                          self.convert_real_ace_right(_ace[1], _ace[0][0]),
+                          AceType(_ace[0][0]))
+                if ace.name == aceInfo.name:
+                    if ace.type == aceInfo.type and ace.right == aceInfo.right:
+                        dacl.DeleteAce(ace_no)
+                        win32security.SetNamedSecurityInfo(object_path, win32security.SE_FILE_OBJECT, self.all_info,
+                                                           self.pwr_sid, self.pwr_sid, dacl, None)
+                        return 1
+                    return 0
+
+    @staticmethod
+    def convert_real_ace_right(right: int, type: int) -> int:
+        ace_right = 0
+        if type == 0:
+            if ntsecuritycon.FILE_GENERIC_READ & right == ntsecuritycon.FILE_GENERIC_READ:
+                ace_right |= win32con.GENERIC_READ
+            if ntsecuritycon.FILE_GENERIC_WRITE & right == ntsecuritycon.FILE_GENERIC_WRITE:
+                ace_right |= win32con.GENERIC_WRITE | ntsecuritycon.FILE_READ_ATTRIBUTES
+            if ntsecuritycon.FILE_GENERIC_EXECUTE & right == ntsecuritycon.FILE_GENERIC_EXECUTE:
+                ace_right |= win32con.GENERIC_EXECUTE
+        else:
+            if ntsecuritycon.FILE_READ_DATA & right == ntsecuritycon.FILE_READ_DATA:
+                ace_right |= ntsecuritycon.FILE_READ_DATA
+            if ntsecuritycon.FILE_WRITE_DATA & right == ntsecuritycon.FILE_WRITE_DATA:
+                ace_right |= ntsecuritycon.FILE_WRITE_DATA
+            if ntsecuritycon.FILE_EXECUTE & right == ntsecuritycon.FILE_EXECUTE:
+                ace_right |= ntsecuritycon.FILE_EXECUTE
+
+        return ace_right
+
+    @staticmethod
+    def file_from_real_file(current_dir: str, file_name: str):
+        sd = win32security.GetFileSecurity(os.path.join(current_dir, file_name),
+                                           win32security.DACL_SECURITY_INFORMATION)
+        dacl = sd.GetSecurityDescriptorDacl()
+        if dacl is None:
+            return File(file_name, [])
+        else:
+            rights_list = defaultdict(lambda: 0)
+            for ace_no in range(0, dacl.GetAceCount()):
+                ace = dacl.GetAce(ace_no)
+                user_name = win32security.LookupAccountSid(None, ace[2])[0]
+                if USER_SUBNAME in user_name:
+                    ace = Ace(user_name, WinApi.convert_real_ace_right(ace[1], ace[0][0]), AceType(ace[0][0]))
+                    rights_list[user_name] |= NormalizedRight.normalized_ace(ace)
+
+            res = []
+            for x in rights_list:
+                res.extend(NormalizedRight.real_right(x, NormalizedRight.effective_right(rights_list[x])))
+            return File(file_name, res)
 
 
 class File(object):
@@ -76,34 +211,25 @@ class File(object):
         self.name = name
         self.rights_list = rights_list
 
-    def create_real_file(self):
+    def create_real_file(self, win_api: WinApi):
         if not os.path.exists(ROOT_FOLDER):
             os.mkdir(ROOT_FOLDER)
         file_name = os.path.join(ROOT_FOLDER, self.name)
         with open(file_name, 'w'): pass
-        set_right(file_name, self.rights_list)
-
-    @staticmethod
-    def _normalise_ace_right(ace: Ace) -> int:
-        right = 0b0
-        if win32con.GENERIC_READ & ace.right:
-            right += 0b001
-        if win32con.GENERIC_WRITE & ace.right:
-            right += 0b010
-        if win32con.GENERIC_EXECUTE & ace.right:
-            right += 0b100
-
-        if ace.type == AceType.DENIED:
-            return right << 3
-        else:
-            return right
+        win_api.set_right(file_name, self.rights_list)
 
     def get_user_mask(self, user: str):
         mask = 0
         for ace in self.rights_list:
             if ace.name == user:
-                mask += self._normalise_ace_right(ace)
+                mask |= NormalizedRight.normalized_ace(ace)
         return mask
+
+    def change_right(self, user: str, deny_new_right: int):
+        for ace in self.rights_list:
+            if ace.name == user and ace.type == AceType.DENIED:
+                ace.right |= NormalizedRight.real_right(user, deny_new_right)[0].right
+        self.rights_list.extend(NormalizedRight.real_right(user, deny_new_right))
 
     def get_file_vector(self, objects: List[str]) -> List[int]:
         res = []
@@ -170,21 +296,21 @@ class Test(object):
         raise NotImplementedError
 
     def generate_ace_list(self, length: int) -> List[Ace]:
-        return [Ace(
-            random.choice(self.users),
-            self.generate_random_right(),
-            random.choice(list(AceType))
-        ) for _ in range(length)]
+        users = random.sample(self.users, length)
+        ace_list = []
+        for _ in range(length):
+            ace_list.extend(NormalizedRight.real_right(users.pop(), self.generate_random_right()))
+        return ace_list
 
     def probably_invert_rights(self, file: File) -> File:
         for ace in file.rights_list:
             if random.randint(1, 100) <= self.prob_inverting:
                 if ace.type == AceType.ALLOWED:
-                    ace.right = self.generate_random_right()
                     ace.type = AceType.DENIED
+                    ace.right = NormalizedRight.real_deny_right(self.generate_random_denied_right())
                 else:
-                    ace.right = self.generate_random_right()
                     ace.type = AceType.ALLOWED
+                    ace.right = NormalizedRight.real_deny_right(self.generate_random_allowed_right())
         return file
 
     @property
@@ -217,15 +343,24 @@ class Test(object):
                         ace_count += i[1]
                     else:
                         ace_count += i[1] * 2
-        print("Number of ACE after optimisation: {0} ({1}) {2:.2%}".format(ace_count, self.number_of_ace,
-                                                                           (1 - ace_count / self.number_of_ace)))
+        print("Possible number of ACE after optimisation: {0} ({1}) {2:.2%}".format(
+            ace_count, self.number_of_ace, (1 - ace_count / self.number_of_ace)))
         return 1 - ace_count / self.number_of_ace
 
     @staticmethod
+    def generate_random_allowed_right():
+        return random.choice([1, 2, 3, 5, 7])
+
+    @staticmethod
+    def generate_random_denied_right():
+        return Test.generate_random_allowed_right() << 3
+
+    @staticmethod
     def generate_random_right():
-        all_rights = [win32con.GENERIC_READ, win32con.GENERIC_WRITE, win32con.GENERIC_EXECUTE]
-        random.shuffle(all_rights)
-        return sum(all_rights[0:random.randint(1, 3)])
+        if random.random() < 0.5:
+            return Test.generate_random_allowed_right()
+        else:
+            return Test.generate_random_denied_right()
 
 
 class MockTest(Test):
@@ -274,40 +409,7 @@ class RealTest(Test):
             # win32net.NetUserDel(self.serverName, userName)
         return obj_list
 
-    def n_right_is_allowed(self, right: int) -> bool:
-        return right < 8
-
-    @staticmethod
-    def n_right_to_ace_list(user_name: str, right: int) -> List[Ace]:
-        result = []
-        res_right = 0b0
-        if 0b001 & right:
-            res_right += win32con.GENERIC_READ
-        if 0b010 & right:
-            res_right += win32con.GENERIC_WRITE
-        if 0b100 & right:
-            res_right += win32con.GENERIC_EXECUTE
-
-        if res_right > 0:
-            result.append(Ace(user_name, right))
-
-        res_right = 0b0
-        if (0b001 << 3) & right:
-            res_right += win32con.GENERIC_READ
-        if (0b010 << 3) & right:
-            res_right += win32con.GENERIC_WRITE
-        if (0b100 << 3) & right:
-            res_right += win32con.GENERIC_EXECUTE
-
-        if res_right > 0:
-            result.append(Ace(user_name, right, AceType.DENIED))
-
-        return result
-
     def save_result(self, vectors, clusters):
-        for file in self.files:
-            file.create_real_file()
-
         with open("out.txt", 'w') as output:
             for centroid, cluster_items in clusters.items():
                 output.write('centroid {}\n'.format(str(centroid)))
@@ -315,56 +417,61 @@ class RealTest(Test):
                     output.write('{} {}\n'.format(self.files[vector_index].name, str(vectors[vector_index])))
 
         folder_number = 0
+        win_api = WinApi()
+        real_ace_count = 0
         for cluster in clusters.values():
             rights_list = []
+            new_file = {}
+            for i in cluster:
+                new_file[i] = deepcopy(self.files[i])
+
             for i in range(len(self.users)):
                 number_aces_for_object = defaultdict(lambda: 0)
                 for vector_index in cluster:
                     number_aces_for_object[vectors[vector_index][i]] += 1
                 number_aces_for_object = sorted(number_aces_for_object.items(), key=lambda v: v[1], reverse=True)
 
-                inherit_index = 0
-                if number_aces_for_object[inherit_index][0] != 0:
-                    if not self.n_right_is_allowed(number_aces_for_object[inherit_index][0]) and \
-                            len([self.n_right_is_allowed(vectors[vector_index][i]) for vector_index in
-                                 cluster]) != 0:
-                        for tmp in number_aces_for_object:
-                            if self.n_right_is_allowed(tmp[0]):
-                                inherit_index = number_aces_for_object.index(tmp)
-                        if inherit_index > 0:
-                            rights_list.extend(
-                                self.n_right_to_ace_list(self.users[i],
-                                                         number_aces_for_object[inherit_index][0]))
+                if number_aces_for_object[0][0] != 0:
+                    if number_aces_for_object[0][1] != len(cluster):
+                        # inherit only allowed right
+                        if NormalizedRight.is_allow(number_aces_for_object[0][0]):
+                            for file in new_file.values():
+                                initial_r = file.get_user_mask(self.users[i])
+                                effective_r = NormalizedRight.effective_right(initial_r | number_aces_for_object[0][0])
+                                if initial_r != effective_r:
+                                    new_deny_right = initial_r ^ effective_r
+                                    file.change_right(self.users[i], new_deny_right << 3)
+                            rights_list.extend(NormalizedRight.real_right(self.users[i], number_aces_for_object[0][0]))
                     else:
-                        rights_list.extend(
-                            self.n_right_to_ace_list(self.users[i], number_aces_for_object[inherit_index][0]))
+                        rights_list.extend(NormalizedRight.real_right(self.users[i], number_aces_for_object[0][0]))
+
+            real_ace_count += len(rights_list)
+            for i in new_file.values():
+                real_ace_count += len(i.rights_list)
+                i.create_real_file(win_api)
 
             folder = os.path.join(ROOT_FOLDER, str(folder_number))
             os.mkdir(folder)
             folder_number += 1
-            set_right(folder, rights_list)
             for file_index in cluster:
-                os.rename(ROOT_FOLDER + self.files[file_index].name, os.path.join(folder, self.files[file_index].name))
+                os.rename(os.path.join(ROOT_FOLDER, new_file[file_index].name),
+                          os.path.join(folder, new_file[file_index].name))
+
+                for ace in rights_list:
+                    real_ace_count -= win_api.delete_ace(os.path.join(folder, new_file[file_index].name), ace)
+
+                win_api.set_right(folder, rights_list)
                 self.check_rights(self.files[file_index], folder)
+        print("Real number of ACE after optimisation: {0} ({1}) {2:.2%}".format(
+            real_ace_count, self.number_of_ace, (1 - real_ace_count / self.number_of_ace)))
 
-    @staticmethod
-    def check_rights(file: File, current_dir: str):
-        sd = win32security.GetFileSecurity(os.path.join(current_dir, file.name),
-                                           win32security.DACL_SECURITY_INFORMATION)
-        dacl = sd.GetSecurityDescriptorDacl()
-        if dacl is None:
-            raise len(file.rights_list) == 0
-        else:
-            rights_list = []
-            for ace_no in range(0, dacl.GetAceCount()):
-                ace = dacl.GetAce(ace_no)
-                user_name = win32security.LookupAccountSid(None, ace[2])[0]
-                if USER_SUBNAME in user_name:
-                    ace = Ace(user_name, convert_real_ace_right(ace[1]), AceType(ace[0][0]))
-                    assert ace in file.rights_list
-                    rights_list.append(ace)
+    def check_rights(self, file: File, current_dir: str):
+        l1 = WinApi.file_from_real_file(current_dir, file.name).get_file_vector(self.users)
+        l2 = file.get_file_vector(self.users)
 
-            assert len(rights_list) == len(file.rights_list)
+        if l1 != l2:
+            for i in range(len(l1)):
+                assert NormalizedRight.is_equal(l1[i], l2[i])
 
 
 def main():
